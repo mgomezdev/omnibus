@@ -4,10 +4,14 @@ services:
     volumes:
       - ../orca/config:/config
       - ../orca/data:/data
+      # Named volume caches the OrcaSlicer AppImage across restarts.
+      # Re-downloaded only when ORCA_VERSION changes.
+      - orca-slicer:/opt/orcaslicer
     shm_size: "1gb"
     environment:
       - TZ=Etc/UTC
       - PYTHONUNBUFFERED=1
+      - ORCA_VERSION=${ORCA_VERSION:-2.4.1}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
       interval: 10s
@@ -32,3 +36,4 @@ services:
 
 volumes:
   themis-data:
+  orca-slicer:
