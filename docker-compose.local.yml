@@ -1,5 +1,5 @@
 # Build from local source instead of pulling from Docker Hub.
-# Requires sibling repos ../orca and ../themis to be present.
+# Requires sibling repos ../orca, ../themis, and ../gridfinity-customizer to be present.
 #
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.local.yml up
@@ -10,3 +10,31 @@ services:
 
   themis:
     build: ../themis
+
+  ordinus:
+    build:
+      context: ../gridfinity-customizer
+      dockerfile: infra/Dockerfile
+    ports:
+      - "${ORDINUS_PORT:-3001}:80"
+    environment:
+      - CORS_ORIGIN=http://localhost:${ORDINUS_PORT:-3001}
+      - LOG_LEVEL=info
+      - THEMIS_URL=http://themis:8000
+    volumes:
+      - ordinus-config:/config
+      - ordinus-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/v1/health').then(r => { if (!r.ok) process.exit(1) })"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      themis:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  ordinus-config:
+  ordinus-data:
