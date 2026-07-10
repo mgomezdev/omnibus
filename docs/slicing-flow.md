@@ -1,6 +1,6 @@
-# Slicing Flow: Themis + Orca Sidecar
+# Slicing Flow: Themis + Laminus Sidecar
 
-This document describes how a print job moves from the Themis queue through the Orca sidecar to a sliced G-code file, including profile resolution and the check-overrides inspection workflow.
+This document describes how a print job moves from the Themis queue through the Laminus sidecar to a sliced G-code file, including profile resolution and the check-overrides inspection workflow.
 
 ---
 
@@ -14,7 +14,7 @@ graph LR
 
     subgraph Docker["Docker Compose"]
         TB[Themis Backend\nFastAPI · port 8000]
-        OS[Orca Sidecar\nFastAPI · port 5000]
+        LS[Laminus Sidecar\nFastAPI · port 5000]
         CLI[OrcaSlicer CLI\nspawned by sidecar]
     end
 
@@ -25,22 +25,22 @@ graph LR
     end
 
     UI -->|HTTP| TB
-    TB -->|HTTP via OrcaSidecarClient| OS
-    OS -->|subprocess| CLI
-    OS -->|scans on startup| SP
-    OS -->|scans on startup| UP
+    TB -->|HTTP via LaminusSidecarClient| LS
+    LS -->|subprocess| CLI
+    LS -->|scans on startup| SP
+    LS -->|scans on startup| UP
     CLI -->|writes gcode| JD
-    OS -->|serves download| TB
+    LS -->|serves download| TB
     TB -->|stores on disk| JD
 ```
 
 **Themis Backend** owns the print queue, job lifecycle, and printer communication.  
-**Orca Sidecar** owns everything slicing-related: the profile catalog, 3MF assembly, and OrcaSlicer invocation.  
+**Laminus Sidecar** owns everything slicing-related: the profile catalog, 3MF assembly, and OrcaSlicer invocation.  
 **Themis never reads profile files directly.** It holds only the names users see (e.g. `"Elegoo Centauri Carbon"`) and the stable UUIDs it discovers from the sidecar catalog.
 
 ---
 
-## 1. Sidecar Startup — Building the Profile Catalog
+## 1. Laminus Startup — Building the Profile Catalog
 
 On container start, the sidecar scans both the system profiles directory and the user config directory to build an in-memory `ProfileCatalog`. Each profile's inheritance chain is resolved once and cached under a `_resolved` key.
 
@@ -74,13 +74,13 @@ When a user opens the profile selector in the UI, or when the queue engine needs
 sequenceDiagram
     participant UI as Frontend
     participant TB as Themis Backend
-    participant SC as OrcaSidecarClient
-    participant OS as Orca Sidecar
+    participant SC as LaminusSidecarClient
+    participant LS as Laminus Sidecar
 
     UI->>TB: GET /api/v1/printers/{id}/profiles
     TB->>SC: get_catalog()
-    SC->>OS: GET /api/profiles
-    OS-->>SC: { machine: [...], process: [...], filament: [...] }
+    SC->>LS: GET /api/profiles
+    LS-->>SC: { machine: [...], process: [...], filament: [...] }
     SC-->>TB: catalog dict (names + UUIDs + compatible_printers)
 
     note over TB: filter process[] and filament[] where<br/>machine_name ∈ compatible_printers
@@ -88,7 +88,7 @@ sequenceDiagram
     TB-->>UI: { print_profiles: ["0.16mm Optimal", ...],<br/>             filament_profiles: ["Elegoo PLA Basic", ...] }
 ```
 
-The printer's `current_orca_printer_profile` (e.g. `"Elegoo Centauri Carbon 0.4 nozzle"`) is the key used to filter compatible process and filament profiles.
+The printer's `current_orca_printer_profile` (e.g. `"Elegoo Centauri Carbon 0.4 nozzle"`) is the key used to filter compatible process and filament profiles (field named for the OrcaSlicer profile system).
 
 ---
 
@@ -126,21 +126,22 @@ sequenceDiagram
 sequenceDiagram
     participant QE as QueueEngine
     participant SS as SlicerService
-    participant SC as OrcaSidecarClient
-    participant OS as Orca Sidecar
+    participant SC as LaminusSidecarClient
+    participant LS as Laminus Sidecar
 
     QE->>SS: slice(SliceRequest)
 
-    SS->>SS: check ORCA_SIDECAR_URL configured
+    SS->>SS: check LAMINUS_SIDECAR_URL configured
     note over SS: raises SliceError if not set
 
     SS->>SS: check prepare_hook is None
     note over SS: raises SliceError if set<br/>(multi-extruder remapping<br/>not yet supported in sidecar mode)
 
+
     alt catalog cache stale (>300s)
         SS->>SC: get_catalog()
-        SC->>OS: GET /api/profiles
-        OS-->>SC: catalog dict
+        SC->>LS: GET /api/profiles
+        LS-->>SC: catalog dict
         SC-->>SS: catalog dict
         SS->>SS: cache catalog + timestamp
     end
@@ -149,18 +150,18 @@ sequenceDiagram
     note over SS: Build name→UUID maps from cache.<br/>Look up machine_preset, process_preset,<br/>each filament_preset by name.
 
     alt any name not found in catalog
-        SS-->>QE: raise SliceError("Profile not found in Orca sidecar catalog — machine=... process=... filaments=...")
+        SS-->>QE: raise SliceError("Profile not found in Laminus sidecar catalog — machine=... process=... filaments=...")
     end
 
     SS->>SC: slice_start(<br/>  source_file,<br/>  machine_uuid, process_uuid, filament_uuids,<br/>  plate, export_3mf,<br/>  extra_config<br/>)
-    SC->>OS: POST /api/slice/start (multipart)
-    OS-->>SC: { "job_id": "abc-123" }
+    SC->>LS: POST /api/slice/start (multipart)
+    LS-->>SC: { "job_id": "abc-123" }
     SC-->>SS: "abc-123"
 
     loop poll every 2 seconds
         SS->>SC: poll_status("abc-123")
-        SC->>OS: GET /api/slice/status/abc-123
-        OS-->>SC: { "status": "slicing" | "completed" | "failed" }
+        SC->>LS: GET /api/slice/status/abc-123
+        LS-->>SC: { "status": "slicing" | "completed" | "failed" }
     end
 
     alt status = "failed"
@@ -169,8 +170,8 @@ sequenceDiagram
     end
 
     SS->>SC: download("abc-123", dest_path)
-    SC->>OS: GET /api/slice/download/abc-123
-    OS-->>SC: gcode bytes
+    SC->>LS: GET /api/slice/download/abc-123
+    LS-->>SC: gcode bytes
     SC->>SC: write to dest_path
     SC-->>SS: Path(dest_path)
 
@@ -180,51 +181,51 @@ sequenceDiagram
     SS-->>QE: gcode_path
 ```
 
-### 3c. Orca Sidecar — POST /api/slice/start Internals
+### 3c. Laminus Sidecar — POST /api/slice/start Internals
 
 ```mermaid
 sequenceDiagram
-    participant SC as OrcaSidecarClient
-    participant OS as Orca Sidecar
+    participant SC as LaminusSidecarClient
+    participant LS as Laminus Sidecar
     participant Cat as ProfileCatalog
     participant CLI as OrcaSlicer CLI
 
-    SC->>OS: POST /api/slice/start\nmultipart: file + UUIDs + plate + extra_config
+    SC->>LS: POST /api/slice/start\nmultipart: file + UUIDs + plate + extra_config
 
-    OS->>Cat: get_by_uuid(machine_uuid)
-    OS->>Cat: get_by_uuid(process_uuid)
-    OS->>Cat: get_by_uuid(filament_uuid) ×N
-    Cat-->>OS: profile entries (with _resolved data)
+    LS->>Cat: get_by_uuid(machine_uuid)
+    LS->>Cat: get_by_uuid(process_uuid)
+    LS->>Cat: get_by_uuid(filament_uuid) ×N
+    Cat-->>LS: profile entries (with _resolved data)
 
-    OS->>OS: validate compatible_printers
+    LS->>LS: validate compatible_printers
 
     alt STL uploaded
-        OS->>OS: stl_to_3mf(raw_path, base_3mf)
+        LS->>LS: stl_to_3mf(raw_path, base_3mf)
     end
 
-    OS->>OS: build_project_settings(\n  machine._resolved,\n  process._resolved,\n  [filament._resolved, ...]\n)
-    note over OS: Merges machine + process + filament<br/>settings into a single flat dict.<br/>Precedence: filament > process > machine.
+    LS->>LS: build_project_settings(\n  machine._resolved,\n  process._resolved,\n  [filament._resolved, ...]\n)
+    note over LS: Merges machine + process + filament<br/>settings into a single flat dict.<br/>Precedence: filament > process > machine.
 
     alt extra_config provided
-        OS->>OS: project_cfg.update(json.loads(extra_config))
-        note over OS: Applies runtime overrides on top:<br/>curr_bed_type, layer_height, etc.
+        LS->>LS: project_cfg.update(json.loads(extra_config))
+        note over LS: Applies runtime overrides on top:<br/>curr_bed_type, layer_height, etc.
     end
 
-    OS->>OS: embed_project_settings(\n  base_3mf,\n  project_cfg,\n  prepared.3mf\n)
-    note over OS: Writes Metadata/project_settings.config<br/>into the 3MF ZIP.
+    LS->>LS: embed_project_settings(\n  base_3mf,\n  project_cfg,\n  prepared.3mf\n)
+    note over LS: Writes Metadata/project_settings.config<br/>into the 3MF ZIP.
 
-    OS->>OS: jobs[job_id] = { status: "pending", ... }
-    OS-->>SC: { "job_id": "abc-123" }
+    LS->>LS: jobs[job_id] = { status: "pending", ... }
+    LS-->>SC: { "job_id": "abc-123" }
 
-    OS->>CLI: xvfb-run -a orcaslicer\n  --slice {plate}\n  --outputdir {dir}\n  --arrange 1\n  [--export-3mf {name}]\n  prepared.3mf
+    LS->>CLI: xvfb-run -a orcaslicer\n  --slice {plate}\n  --outputdir {dir}\n  --arrange 1\n  [--export-3mf {name}]\n  prepared.3mf
 
     alt slice fails AND geometry_only_retry=true
-        OS->>OS: strip Metadata/model_settings.config\nfrom 3MF → write geo.3mf
-        OS->>CLI: retry with geo.3mf
+        LS->>LS: strip Metadata/model_settings.config\nfrom 3MF → write geo.3mf
+        LS->>CLI: retry with geo.3mf
     end
 
-    CLI-->>OS: plate_1.gcode [+ .gcode.3mf]
-    OS->>OS: jobs[job_id].status = "completed"\njobs[job_id].sliced_file = "plate_1.gcode"
+    CLI-->>LS: plate_1.gcode [+ .gcode.3mf]
+    LS->>LS: jobs[job_id].status = "completed"\njobs[job_id].sliced_file = "plate_1.gcode"
 ```
 
 ### 3d. Queue Engine — After Slicing
@@ -261,14 +262,14 @@ When the user uploads a 3MF with baked-in slicer settings, Themis can diff those
 sequenceDiagram
     participant UI as Frontend
     participant TB as Themis Backend
-    participant SC as OrcaSidecarClient
-    participant OS as Orca Sidecar
+    participant SC as LaminusSidecarClient
+    participant LS as Laminus Sidecar
 
     UI->>TB: POST /api/v1/jobs/{id}/check-overrides\n(multipart: machine, print_profile, filament_profile, file)
 
     TB->>SC: get_catalog()
-    SC->>OS: GET /api/profiles
-    OS-->>SC: catalog dict
+    SC->>LS: GET /api/profiles
+    LS-->>SC: catalog dict
     SC-->>TB: catalog dict
 
     TB->>TB: build name→UUID maps
@@ -281,9 +282,9 @@ sequenceDiagram
     end
 
     TB->>SC: get_merged_config(machine_uuid, process_uuid, [filament_uuid])
-    SC->>OS: POST /api/profiles/merged-config\n{ machine_uuid, process_uuid, filament_uuids }
-    OS->>OS: build_project_settings(_resolved data)
-    OS-->>SC: canonical_config dict
+    SC->>LS: POST /api/profiles/merged-config\n{ machine_uuid, process_uuid, filament_uuids }
+    LS->>LS: build_project_settings(_resolved data)
+    LS-->>SC: canonical_config dict
     SC-->>TB: canonical_config dict
 
     TB->>TB: inspect_overrides(\n  uploaded_3mf_path,\n  canonical_config,\n  filament_slots\n)
@@ -304,7 +305,7 @@ flowchart TD
 
     D --> E[SlicerService.slice]
 
-    E --> F{ORCA_SIDECAR_URL\nconfigured?}
+    E --> F{LAMINUS_SIDECAR_URL\nconfigured?}
     F -- No --> FAIL1[SliceError:\nURL not configured]
 
     F -- Yes --> G{prepare_hook\nset?}
@@ -315,7 +316,7 @@ flowchart TD
     H --> I{All UUIDs\nfound?}
     I -- No --> FAIL3[SliceError:\nprofile not found\nin sidecar catalog]
 
-    I -- Yes --> J[OrcaSidecarClient.slice_start\nPOST /api/slice/start\nmachine + process + filament UUIDs\nplate + extra_config]
+    I -- Yes --> J[LaminusSidecarClient.slice_start\nPOST /api/slice/start\nmachine + process + filament UUIDs\nplate + extra_config]
 
     J --> K[Sidecar: resolve _resolved data\nbuild_project_settings\nmerge extra_config\nembed into 3MF\nlaunch OrcaSlicer CLI]
 
@@ -335,7 +336,7 @@ flowchart TD
 | Invariant | Where enforced |
 |---|---|
 | Themis never reads profile JSON files | `slicer_service.py` — no file imports |
-| All profile data comes from `GET /api/profiles` | `OrcaSidecarClient.get_catalog()` |
+| All profile data comes from `GET /api/profiles` | `LaminusSidecarClient.get_catalog()` |
 | Profile catalog cached 300 s | `SlicerService._CATALOG_TTL = 300.0` |
 | `extra_config` (bed type, job overrides) applied **after** profile resolution | Sidecar `start_slice` handler |
 | Inheritance flattened once at catalog build time | `ProfileCatalog` on sidecar startup |
@@ -348,10 +349,10 @@ flowchart TD
 
 | Condition | Error | Source |
 |---|---|---|
-| `ORCA_SIDECAR_URL` not set | `SliceError: ORCA_SIDECAR_URL is not configured` | `SlicerService.slice` |
+| `LAMINUS_SIDECAR_URL` not set | `SliceError: LAMINUS_SIDECAR_URL is not configured` | `SlicerService.slice` |
 | `prepare_hook` is set (multi-extruder job) | `SliceError: prepare_hook not supported` | `SlicerService.slice` |
 | Catalog fetch fails (sidecar down) | `SliceError: Profile not found…` | `SlicerService._resolve_uuids` |
 | Profile name not in catalog | `SliceError: Profile not found…` | `SlicerService._resolve_uuids` |
 | OrcaSlicer CLI returns non-zero (both attempts) | `SidecarError` → `SliceError` | Sidecar `run_orcaslicer_task` |
-| Sidecar poll timeout (>620 s) | `SidecarError: sidecar poll timed out` | `OrcaSidecarClient.poll_status` |
+| Sidecar poll timeout (>620 s) | `SidecarError: sidecar poll timed out` | `LaminusSidecarClient.poll_status` |
 | `extra_config` is not a JSON object | HTTP 422 | Sidecar `start_slice` |

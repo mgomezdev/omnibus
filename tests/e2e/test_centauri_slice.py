@@ -1,5 +1,5 @@
 """
-Integration test: slice for Elegoo Centauri Carbon via the full omnibus stack.
+Integration test: slice for Elegoo Centauri Carbon via the full Concordia stack.
 
 Profiles under test:
   machine:  Elegoo Centauri Carbon 0.4 nozzle
@@ -11,7 +11,7 @@ startup with ip_address 192.0.2.1 (TEST-NET-1, never routes), so the job
 parks at "sliced" instead of attempting an upload.
 
 Run from inside the Docker network (port 8000 is internal):
-    docker exec omnibus-themis-1 sh -c "
+    docker exec concordia-themis-1 sh -c "
         pip install pytest requests -q &&
         cd /app &&
         THEMIS_URL=http://localhost:8000 pytest /e2e/test_centauri_slice.py --integration -v
@@ -53,7 +53,7 @@ def _minimal_stl() -> bytes:
     ]
     buf = io.BytesIO()
     # Binary STL header must be exactly 80 bytes.
-    header = b"Omnibus e2e: Centauri 0.4mm PLA 0.16mm Optimal"
+    header = b"Concordia e2e: Centauri 0.4mm PLA 0.16mm Optimal"
     buf.write(header.ljust(80, b" "))
     buf.write(struct.pack("<I", len(triangles)))
     for normal, v1, v2, v3 in triangles:
@@ -145,7 +145,7 @@ def test_centauri_slice_reaches_sliced_status(
     # doesn't skip slicing the new test job (one pending sliced-job-per-printer).
     _drain_active_jobs_for_printer(http, printer_id)
 
-    # Confirm profiles are served by the Orca sidecar for this printer
+    # Confirm profiles are served by the Laminus sidecar for this printer
     resp = http.get(f"{THEMIS_URL}/api/v1/printers/{printer_id}/profiles", timeout=15)
     resp.raise_for_status()
     profiles = resp.json()
@@ -191,5 +191,5 @@ def test_centauri_slice_reaches_sliced_status(
 
     assert result.get("ok") is True, (
         f"verify-slice failed for job {job_id}: {result.get('error')!r}\n"
-        "Check Orca logs: docker compose logs orca | tail -50"
+        "Check Laminus logs: docker compose logs laminus | tail -50"
     )

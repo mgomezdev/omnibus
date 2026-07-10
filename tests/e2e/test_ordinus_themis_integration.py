@@ -277,7 +277,7 @@ def test_ordinus_layout_slices_on_elegoo_centauri(
       1. BOM generation produces STLs for the layout
       2. send-to-themis uploads those STLs to the Themis library
       3. The Themis library file can be used as the source for a print job
-      4. The Orca sidecar slices the gridfinity STL with Elegoo Centauri Carbon
+      4. The Laminus sidecar slices the gridfinity STL with Elegoo Centauri Carbon
          profiles and the job reaches "sliced" status
     """
     lib_id, item = library_item
@@ -302,7 +302,7 @@ def test_ordinus_layout_slices_on_elegoo_centauri(
     # Clear any leftover active jobs so the queue engine can slice our new job
     _drain_active_jobs_for_printer(themis, printer_id)
 
-    # Confirm Orca serves the Centauri Carbon profiles for this printer
+    # Confirm Laminus serves the Centauri Carbon profiles for this printer
     resp = themis.get(f"{THEMIS_URL}/api/v1/printers/{printer_id}/profiles", timeout=15)
     resp.raise_for_status()
     profiles = resp.json()
@@ -352,5 +352,5 @@ def test_ordinus_layout_slices_on_elegoo_centauri(
         f"verify-slice failed for job {job_id}: {result.get('error')!r}\n"
         f"  Ordinus layout: {layout_id}, Themis project: {themis_pid}, "
         f"file_id: {uploaded_file_id}\n"
-        "Check logs: docker compose logs orca | tail -50"
+        "Check logs: docker compose logs laminus | tail -50"
     )

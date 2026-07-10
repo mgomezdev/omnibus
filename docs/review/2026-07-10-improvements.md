@@ -11,24 +11,25 @@ Ranked by impact × urgency for the target use case: personal farm, <10 printers
 
 | # | Title | Category | Effort |
 |---|---|---|---|
-| 1 | [Fix Ordinus→Themis 422 on project generation](#1-fix-ordinusthemis-422-on-project-generation) | Bug | S |
-| 2 | [Add project tracking: project_id on jobs + progress view](#2-add-project-tracking-project_id-on-jobs--progress-view) | Feature | M |
-| 3 | [Fix check_overrides NameError](#3-fix-check_overrides-nameerror) | Bug | XS |
+| 1 | [Fix Ordinus→Themis 422 on project generation](#1-fix-ordinusthemis-422-on-project-generation) ✅ | Bug | S |
+| 2 | [Add project tracking: project_id on jobs + progress view](#2-add-project-tracking-project_id-on-jobs--progress-view) ✅ | Feature | M |
+| 3 | [Fix check_overrides NameError](#3-fix-check_overrides-nameerror) ✅ | Bug | XS |
 | 4 | [Add Spoolman to compose stack](#4-add-spoolman-to-compose-stack) | DevOps | S |
-| 5 | [Persist Laminus job state across restarts](#5-persist-laminus-job-state-across-restarts) | Reliability | M |
+| 5 | [Persist Laminus job state across restarts](#5-persist-laminus-job-state-across-restarts) ✅ | Reliability | M |
 | 6 | [Fix CORS_ORIGIN for LAN access](#6-fix-cors_origin-for-lan-access) | Bug | XS |
 | 7 | [Webhook notifications on job state change](#7-webhook-notifications-on-job-state-change) | Feature | S |
-| 8 | [Print history view](#8-print-history-view) | Feature | S |
+| 8 | [Print history view](#8-print-history-view) ✅ | Feature | S |
 | 9 | [Surface filament estimates + Spoolman inventory check](#9-surface-filament-estimates--spoolman-inventory-check) | Feature | M |
-| 10 | [Cache Laminus profile catalog to disk](#10-cache-laminus-profile-catalog-to-disk) | Reliability | S |
+| 10 | [Cache Laminus profile catalog to disk](#10-cache-laminus-profile-catalog-to-disk) ✅ | Reliability | S |
 | 11 | [Unify Projects and Orders into one concept](#11-unify-projects-and-orders-into-one-concept) | Refactor | L |
 | 12 | [Add Themis healthcheck to compose](#12-add-themis-healthcheck-to-compose) ✅ | DevOps | XS |
 | 13 | [Fix compose bind-mount paths for Laminus](#13-fix-compose-bind-mount-paths-for-laminus) ✅ | Bug | XS |
-| 14 | [Remove dead auth plumbing in Ordinus](#14-remove-dead-auth-plumbing-in-ordinus) | Cleanup | S |
+| 14 | [Remove dead auth plumbing in Ordinus](#14-remove-dead-auth-plumbing-in-ordinus) ✅ | Cleanup | S |
 | 15 | [Add themis-data backup documentation](#15-add-themis-data-backup-documentation) | Docs | XS |
 | 16 | [Fix documentation drift (data-model.md, Ordinus README)](#16-fix-documentation-drift) | Docs | S |
 | 17 | [Profile onboarding UI in Themis settings](#17-profile-onboarding-ui-in-themis-settings) | UX | M |
 | 18 | [Mobile-responsive UI](#18-mobile-responsive-ui) | UX | L |
+| 19 | [Manual job outcome marking + per-item failure tracking](#19-manual-job-outcome-marking--per-item-failure-tracking) ✅ | Feature | M |
 
 ---
 
@@ -36,7 +37,7 @@ Ranked by impact × urgency for the target use case: personal farm, <10 printers
 
 ---
 
-### 1. Fix Ordinus→Themis 422 on project generation
+### 1. Fix Ordinus→Themis 422 on project generation ✅
 
 **Category:** Bug  
 **Effort:** S (1 day)  
@@ -496,7 +497,7 @@ In `docker-compose.yml` (the production/pull version), if these are bind mounts 
 
 ---
 
-### 14. Remove dead auth plumbing in Ordinus
+### 14. Remove dead auth plumbing in Ordinus ✅
 
 **Category:** Cleanup  
 **Effort:** S (half day)  
@@ -640,3 +641,41 @@ Use CSS media queries or Tailwind responsive utilities (check which CSS framewor
 **Files likely touched**
 - Themis frontend: queue, printer fleet, and job detail screen components
 - Global CSS / layout components
+
+---
+
+### 19. Manual job outcome marking + per-item failure tracking ✅
+
+**Category:** Feature
+**Effort:** M (2 days)
+**Repos:** `themis`
+
+**Problem**
+Once a print job completes, there was no way for the user to record whether it succeeded or which parts failed. Over multiple plates of a multi-part project, failures accumulated silently — the user had no reliable way to know how many of each part had been successfully printed vs. needed to be reprinted.
+
+**What was built**
+
+- `JobItemFailure` table — per-job, per-item audit records with `quantity_failed` and `quantity_on_plate` snapshot (enables re-marking without data corruption).
+- `Job.outcome` — null (unreviewed) or "reviewed". `Job.project_item_quantities` — JSON dict `{item_id: qty_on_this_plate}` stored at job creation time, distributing group quantities evenly across plates (remainder to first N plates).
+- `ProjectItem.quantity_failed` and `ProjectItem.quantity_completed` — denormalized counters updated atomically when outcome is marked. Clamp-safe reversal on re-mark.
+- `PUT /api/v1/jobs/{id}/outcome` — accepts per-item failure list; reverses previous increments, applies new ones, returns updated job.
+- **History screen**: "Outcome" column with "✓ Reviewed" badge or "Mark" button for unreviewed complete project jobs.
+- **OutcomeModal**: fetches project item names, shows per-plate quantities, per-item failure count inputs, "Mark All Good" and "Mark All Failed" convenience buttons.
+- **Project builder**: shows `N/total ok · M failed` per part when counts are non-zero.
+
+**Design decisions**
+- No auto-requeue — failures are tracked so the user can consolidate plates and requeue manually.
+- Per-plate quantities estimated by even distribution (slicer doesn't expose a manifest); user can adjust in the modal.
+- `quantity_failed` on `ProjectItem` is denormalized for easy per-item success rate reporting.
+- Outcome is re-markable — the endpoint reverses prior increments using the `quantity_on_plate` snapshot before applying new values.
+
+**Files touched**
+- `themis/backend/app/models.py`
+- `themis/backend/app/database.py`
+- `themis/backend/app/api/routes/jobs.py`
+- `themis/backend/app/api/routes/projects.py`
+- `themis/frontend/src/components/OutcomeModal.tsx` (new)
+- `themis/frontend/src/screens/HistoryScreen.tsx`
+- `themis/frontend/src/screens/ProjectBuilderScreen.tsx`
+- `themis/frontend/src/api/projects.ts`
+- `themis/frontend/src/api/queue.ts`

@@ -13,7 +13,7 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "integration: requires the full omnibus Docker stack to be running",
+        "integration: requires the full Concordia Docker stack to be running",
     )
 
 
