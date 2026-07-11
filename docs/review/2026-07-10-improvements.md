@@ -25,9 +25,9 @@ Ranked by impact × urgency for the target use case: personal farm, <10 printers
 | 12 | [Add Themis healthcheck to compose](#12-add-themis-healthcheck-to-compose) ✅ | DevOps | XS |
 | 13 | [Fix compose bind-mount paths for Laminus](#13-fix-compose-bind-mount-paths-for-laminus) ✅ | Bug | XS |
 | 14 | [Remove dead auth plumbing in Ordinus](#14-remove-dead-auth-plumbing-in-ordinus) ✅ | Cleanup | S |
-| 15 | [Add themis-data backup documentation](#15-add-themis-data-backup-documentation) | Docs | XS |
+| 15 | [Add themis-data backup documentation](#15-add-themis-data-backup-documentation) ~~won't implement~~ | Docs | XS |
 | 16 | [Fix documentation drift (data-model.md, Ordinus README)](#16-fix-documentation-drift) | Docs | S |
-| 17 | [Profile onboarding UI in Themis settings](#17-profile-onboarding-ui-in-themis-settings) | UX | M |
+| 17 | [Profile onboarding UI in Themis settings](#17-profile-onboarding-ui-in-themis-settings) ~~won't implement~~ | UX | M |
 | 18 | [Mobile-responsive UI](#18-mobile-responsive-ui) | UX | L |
 | 19 | [Manual job outcome marking + per-item failure tracking](#19-manual-job-outcome-marking--per-item-failure-tracking) ✅ | Feature | M |
 
