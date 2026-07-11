@@ -14,21 +14,21 @@ Ranked by impact × urgency for the target use case: personal farm, <10 printers
 | 1 | [Fix Ordinus→Themis 422 on project generation](#1-fix-ordinusthemis-422-on-project-generation) ✅ | Bug | S |
 | 2 | [Add project tracking: project_id on jobs + progress view](#2-add-project-tracking-project_id-on-jobs--progress-view) ✅ | Feature | M |
 | 3 | [Fix check_overrides NameError](#3-fix-check_overrides-nameerror) ✅ | Bug | XS |
-| 4 | [Add Spoolman to compose stack](#4-add-spoolman-to-compose-stack) | DevOps | S |
+| 4 | [Add Spoolman to compose stack](#4-add-spoolman-to-compose-stack) ~~won't implement~~ | DevOps | S |
 | 5 | [Persist Laminus job state across restarts](#5-persist-laminus-job-state-across-restarts) ✅ | Reliability | M |
-| 6 | [Fix CORS_ORIGIN for LAN access](#6-fix-cors_origin-for-lan-access) | Bug | XS |
-| 7 | [Webhook notifications on job state change](#7-webhook-notifications-on-job-state-change) | Feature | S |
+| 6 | [Fix CORS_ORIGIN for LAN access](#6-fix-cors_origin-for-lan-access) ✅ | Bug | XS |
+| 7 | [Webhook notifications on job state change](#7-webhook-notifications-on-job-state-change) ✅ | Feature | S |
 | 8 | [Print history view](#8-print-history-view) ✅ | Feature | S |
-| 9 | [Surface filament estimates + Spoolman inventory check](#9-surface-filament-estimates--spoolman-inventory-check) | Feature | M |
+| 9 | [Surface filament estimates + Spoolman inventory check](#9-surface-filament-estimates--spoolman-inventory-check) ✅ | Feature | M |
 | 10 | [Cache Laminus profile catalog to disk](#10-cache-laminus-profile-catalog-to-disk) ✅ | Reliability | S |
-| 11 | [Unify Projects and Orders into one concept](#11-unify-projects-and-orders-into-one-concept) | Refactor | L |
+| 11 | [Unify Projects and Orders into one concept](#11-unify-projects-and-orders-into-one-concept) ✅ | Refactor | L |
 | 12 | [Add Themis healthcheck to compose](#12-add-themis-healthcheck-to-compose) ✅ | DevOps | XS |
 | 13 | [Fix compose bind-mount paths for Laminus](#13-fix-compose-bind-mount-paths-for-laminus) ✅ | Bug | XS |
 | 14 | [Remove dead auth plumbing in Ordinus](#14-remove-dead-auth-plumbing-in-ordinus) ✅ | Cleanup | S |
 | 15 | [Add themis-data backup documentation](#15-add-themis-data-backup-documentation) ~~won't implement~~ | Docs | XS |
-| 16 | [Fix documentation drift (data-model.md, Ordinus README)](#16-fix-documentation-drift) | Docs | S |
+| 16 | [Fix documentation drift (data-model.md, Ordinus README)](#16-fix-documentation-drift) ✅ | Docs | S |
 | 17 | [Profile onboarding UI in Themis settings](#17-profile-onboarding-ui-in-themis-settings) ~~won't implement~~ | UX | M |
-| 18 | [Mobile-responsive UI](#18-mobile-responsive-ui) | UX | L |
+| 18 | [Mobile-responsive UI](#18-mobile-responsive-ui) ✅ | UX | L |
 | 19 | [Manual job outcome marking + per-item failure tracking](#19-manual-job-outcome-marking--per-item-failure-tracking) ✅ | Feature | M |
 
 ---

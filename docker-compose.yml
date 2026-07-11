@@ -54,7 +54,7 @@ services:
       - ordinus-config:/config
       - ordinus-data:/data
     environment:
-      - CORS_ORIGIN=http://localhost:${ORDINUS_PORT:-3001}
+      - CORS_ORIGIN=${CORS_ORIGIN:-*}
       - LOG_LEVEL=info
       - THEMIS_URL=http://themis:8000
     healthcheck:
