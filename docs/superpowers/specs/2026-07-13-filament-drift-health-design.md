@@ -1,7 +1,8 @@
 # Filament Consumption, Profile Drift & Laminus Health — Design Spec
 
-**Date:** 2026-07-13
-**Status:** Approved
+**Date:** 2026-07-13  
+**Revised:** 2026-07-13 (post Fable review)  
+**Status:** Approved  
 **Repos:** `themis`
 
 ---
@@ -10,11 +11,11 @@
 
 Three self-contained enhancements to the Themis/Laminus stack:
 
-1. **Filament consumption tracking** — surface per-job weight in the history view and auto-deduct from Spoolman spools when a job completes.
-2. **Profile drift detection** — on-demand report of stale OrcaSlicer profile references across printers, jobs, project items, and Spoolman filaments.
-3. **Laminus health chip** — a sidebar status indicator showing whether the sidecar is up, building, or offline, with catalog counts in a detail popover.
+1. **Filament consumption tracking** — persist per-job actual grams on the `Job` row; surface in history view; auto-deduct from the correct Spoolman spool on completion.
+2. **Profile drift detection** — on-demand report of stale OrcaSlicer profile references across printers, jobs, and Spoolman filaments.
+3. **Laminus health chip** — a sidebar status indicator showing whether the sidecar is up, building, or offline, with catalog counts in a detail panel.
 
-None of these features require DB schema changes or migrations. All new backend state is either computed on-the-fly or held in module-level memory caches.
+Feature 1 requires one migration (v008). Features 2 and 3 require no schema changes.
 
 ---
 
@@ -22,16 +23,47 @@ None of these features require DB schema changes or migrations. All new backend 
 
 ### Background
 
-`GcodeFile.filament_grams` is already extracted from each sliced gcode file and stored in SQLite. The job-detail endpoint (`GET /api/v1/jobs/{id}/details`) and project-detail endpoint (`GET /api/v1/projects/{id}`) already return this field and aggregate it respectively. `JobDetailScreen` and `ProjectDetailScreen` already render it.
+`GcodeFile.filament_grams` is extracted at slice time and stored, but the `GcodeFile` row is **deleted at job completion** inside `handle_print_complete` (and the reconcile path). This means:
 
-Two gaps remain:
+- A post-completion hook cannot query `GcodeFile` — it is gone.
+- A history join on `gcode_files` returns null for every completed job.
 
-- The **history list** (`GET /api/v1/jobs/history`) does not join `gcode_files`, so `HistoryJob` carries no filament data.
-- **Spoolman is never notified** when plastic is consumed; its `remaining_weight` / `used_weight` drifts out of sync after every print.
+The fix is to persist grams on the `Job` row before the delete.
 
-### Backend — `jobs.py › list_history`
+### Migration v008 — add `filament_grams` to `jobs`
 
-Add a join against `gcode_files` keyed on `job_id`. Include `filament_grams` (float or null) in each row of the history response. Use the first `GcodeFile` row per job (same `.limit(1)` pattern as `get_job_details`).
+```sql
+ALTER TABLE jobs ADD COLUMN filament_grams REAL;
+```
+
+Standard idempotent migration file: `backend/app/migrations/v008_job_filament_grams.py`.  
+Existing completed jobs get `NULL` (correct — grams were not captured for them).
+
+### Backend — `queue_engine.py › handle_print_complete`
+
+Inside the existing session block, **before** `session.delete(gcode)`:
+
+```python
+if gcode and gcode.filament_grams is not None:
+    job.filament_grams = gcode.filament_grams
+```
+
+After `session.commit()`, if `job.filament_grams` is not null, resolve the Spoolman spool and fire the deduction (see below).
+
+**Idempotency:** `handle_print_complete` already guards on `job.status == "printing"` which is set to `"complete"` before commit. The reconcile path calls the same function and hits the same guard — double-deduction is structurally prevented.
+
+### Backend — Spoolman spool resolution
+
+The Spoolman spool ID lives in `Printer.loaded_filaments[slot]["spoolman_spool_id"]`, **not** in `JobPrinterConfig.filament_id` (which is the Spoolman filament-type ID).
+
+Resolution in `handle_print_complete`, after commit (printer_id is already known):
+
+1. Load `Printer` for `printer_id` → `loaded = printer.loaded_filaments`
+2. Load `JobPrinterConfig` where `job_id = job.id AND printer_id = printer_id`
+3. Call `_slot_for_config(config, loaded)` — already imported in queue_engine — to get the matched slot dict
+4. Read `slot.get("spoolman_spool_id")` → skip deduction if None
+
+**Multi-tool policy:** A single `GcodeFile.filament_grams` value represents the total for all tools on that printer. Deduct the full total against slot 0 (the primary slot) only. Multi-tool deduction per-slot is out of scope — OrcaSlicer's gcode header does not break grams out per tool.
 
 ### Backend — `spoolman_service.py`
 
@@ -41,53 +73,81 @@ Add:
 async def record_spool_use(
     url: str, api_key: str | None, spool_id: int, grams: float
 ) -> None:
-    """PUT /api/v1/spool/{spool_id}/use — records filament consumption in Spoolman."""
+    """PUT /api/v1/spool/{spool_id}/use — records filament consumption."""
+    headers = _headers(api_key)
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.put(
+            f"{url.rstrip('/')}/api/v1/spool/{spool_id}/use",
+            json={"use_weight": grams},
+            headers=headers,
+        )
+        resp.raise_for_status()
 ```
 
-Calls Spoolman's standard use endpoint with `{"use_weight": grams}`. Raises `httpx.HTTPStatusError` on failure (callers log and swallow).
+### Backend — fire-and-forget deduction in `handle_print_complete`
 
-### Backend — `queue_engine.py`
+After commit, in a `try/except`:
 
-After the job moves to `complete` status (existing completion callback), add a fire-and-forget coroutine:
+```python
+asyncio.create_task(_deduct_spool(spoolman_cfg, spool_id, job.filament_grams))
+```
 
-1. Load `SpoolmanConfig` (id=1); skip if not enabled.
-2. Query `GcodeFile` for the job; skip if `filament_grams` is null.
-3. Query `JobPrinterConfig` rows for the job; for each config where `filament_id` is not null, call `record_spool_use(config.filament_id, gcode.filament_grams)`.
-4. Log warning on any HTTP error; never raise (must not affect job state machine).
+`_deduct_spool` is a module-level async helper that calls `record_spool_use` and logs a warning on failure. It never raises — print completion must not be affected by Spoolman availability.
 
-`filament_id` on `JobPrinterConfig` is the Spoolman **spool** ID (the physical roll), not the filament-type ID.
+### Backend — `jobs.py › list_history`
+
+`Job.filament_grams` is now a direct column — no join required. Add it to `_to_dict(job)` and to the history response. The existing `HistoryJob` interface on the frontend needs `filament_grams: number | null`.
 
 ### Frontend — `HistoryScreen.tsx`
 
 - Add `filament_grams: number | null` to the `HistoryJob` interface.
-- Add a `"Filament"` column header to the history table.
-- Render each row's `filament_grams` as `"{n} g"` (one decimal place), or `"—"` if null.
+- Add a `"Filament"` column to the history table.
+- Render `"{n.toFixed(1)} g"` or `"—"` when null.
 
 ---
 
-## Feature 2 — Profile Drift Detection + Spoolman Sync Check
+## Feature 2 — Profile Drift Detection
 
 ### Goal
 
-One endpoint that computes, on demand, a structured report of every stale OrcaSlicer profile reference in the system — across four object types. "Stale" means a profile name or UUID that no longer exists in the current Laminus catalog.
+One endpoint that computes, on demand, a structured report of stale OrcaSlicer profile references across three object types. No server-side cache — the check is fast (small-table SELECTs + set lookups) and runs only when a user visits the Settings page.
+
+### Shared catalog helper — `services/catalog_utils.py`
+
+`settings.py` (lines 272–276) already builds `machine_names` and `filament_names` sets from the catalog. Extract this logic into a shared function rather than duplicating it in `drift.py`:
+
+```python
+def catalog_name_sets(catalog: dict) -> tuple[set[str], set[str], set[str], set[str]]:
+    """Returns (machine_names, process_names, filament_names, filament_uuids)."""
+```
+
+Update `settings.py` to use this helper. `drift.py` uses it too.
 
 ### New endpoint — `GET /api/v1/drift`
 
-**New file:** `backend/app/api/routes/drift.py`  
-Registered in `main.py` alongside other routers.
+**New file:** `backend/app/api/routes/drift.py`. Registered in `main.py`.
 
 **Algorithm:**
 
-1. Load the cached catalog via `get_cached_catalog()` from `routes/laminus.py`. This never hits the sidecar if the cache is warm.
-2. Build lookup structures:
-   - `machine_names: set[str]` — all machine profile names
-   - `process_names: set[str]` — all process profile names
-   - `filament_names: set[str]` — all filament profile names
-   - `filament_uuids: set[str]` — all filament profile UUIDs
-3. **Printers check:** Load all `Printer` rows. For each printer, flag `current_orca_printer_profile` if not in `machine_names`. For each entry in `loaded_filaments` (JSON list), flag `filament_profile` (if present) if not in `filament_names`.
-4. **Jobs check:** Load all `Job` rows with `status IN ('queued', 'blocked')`. For each, load its `JobPrinterConfig` rows. Flag `print_profile` if not in `process_names`; flag `filament_profile` if not null and not in `filament_names`.
-5. **Project items check:** Load all `ProjectItem` rows where `filament_profile_uuid != ""`. Flag rows whose UUID is not in `filament_uuids`.
-6. **Spoolman filaments check** (skip if `SpoolmanConfig` not enabled): Fetch all filaments via `spoolman_service.fetch_filaments()`. For each filament, decode `extra.orca_profiles` (double-JSON-encoded per existing convention). Flag any UUID key not found in `filament_uuids`.
+1. Call `get_cached_catalog()` from `routes/laminus.py`. If the catalog is cold and Laminus is unreachable, this raises HTTPException — let it propagate. The Settings UI shows the standard 502/503 error.
+2. Call `catalog_name_sets(catalog)` → four sets.
+3. Load `SpoolmanConfig` (id=1).
+
+**Printers check:**  
+For each `Printer` row:
+- Skip `current_orca_printer_profile` if null (printer not yet configured).
+- Flag if machine profile name not in `machine_names`.
+- For each entry in `loaded_filaments`, flag `filament_profile` if not null and not in `filament_names`.
+
+**Jobs check:**  
+For each `Job` where `status IN ('queued', 'blocked')`:
+- Load its `JobPrinterConfig` rows.
+- Flag `print_profile` if not in `process_names`; flag `filament_profile` if not null and not in `filament_names`.
+
+**Spoolman filaments check** (skip if `SpoolmanConfig` not enabled):  
+Call `fetch_filaments()`. For each filament, decode `extra.orca_profiles` (double-JSON-encoded). Flag any UUID key not in `filament_uuids`. On HTTP error, set `spoolman_error` and omit this section.
+
+**Dropped from v1:** The `ProjectItem.filament_profile_uuid` check. That field is a legacy artifact (`models.py:186-187`) that no current UI path populates. Flagging it produces alarms with no actionable remediation.
 
 **Response shape:**
 
@@ -95,68 +155,74 @@ Registered in `main.py` alongside other routers.
 {
   "checked_at": "2026-07-13T10:00:00Z",
   "catalog_age_seconds": 42,
-  "all_clear": false,
-  "printers": [
-    {"id": 1, "name": "Centauri", "stale": ["Elegoo Centauri Carbon 0.4 nozzle (old)"]}
-  ],
+  "all_clear": true,
+  "printers": [],
   "jobs": [
-    {"id": 5, "stale": ["PLA @0.20mm Standard"]}
+    {"id": 5, "file_name": "bracket.3mf", "stale": ["PLA @0.20mm Standard"]}
   ],
-  "project_items": [
-    {"id": 12, "project_id": 3, "project_name": "Gridfinity Layout A", "stale_uuid": "abc-123-..."}
-  ],
-  "spoolman_filaments": [
-    {"id": 7, "name": "Polymaker PLA+ Black", "stale_uuids": ["def-456-..."]}
-  ]
+  "spoolman_filaments": [],
+  "spoolman_error": null
 }
 ```
 
-`all_clear` is `true` only when all four lists are empty.
+`all_clear` is `true` only when all three lists are empty and `spoolman_error` is null (or Spoolman is disabled).
 
-**Caching:** Module-level `_drift_cache: dict | None` and `_drift_cached_at: float | None` in `drift.py`. TTL = 300 s. The cache is invalidated (set to `None`) when `POST /api/v1/laminus/catalog/refresh` or `POST /api/v1/laminus/catalog/rescan` runs — add a `invalidate_drift_cache()` helper that `laminus.py` calls at the end of both those handlers.
+Include `file_name` in job entries (from `UploadedFile.original_filename`) so the report is immediately actionable.
 
-**Spoolman error handling:** If `fetch_filaments` raises, return the drift report without the `spoolman_filaments` section and include `"spoolman_error": "..."` at the top level.
+### Frontend — `api/drift.ts`
 
-### Frontend — `SettingsScreen.tsx`
-
-Add a **"Profile Drift"** section to the Settings page (below the existing Spoolman section):
-
-- On mount, `GET /api/v1/drift` and render the result.
-- If `all_clear: true`, show a green "All profiles current" line.
-- If not all clear, render one collapsible accordion per non-empty category (Printers / Jobs / Project Items / Spoolman Filaments), each showing the count in the header and the affected names/IDs in the body.
-- A "Re-check" button re-fetches (bypasses client-side cache by just refetching; the server cache handles deduplication).
-
-### New frontend API function — `api/drift.ts`
-
+New file:
 ```typescript
-export interface DriftReport { /* matches response shape above */ }
+export interface DriftReport { /* matches response shape */ }
 export async function fetchDriftReport(): Promise<DriftReport>
 ```
 
+### Frontend — `SettingsScreen.tsx`
+
+Add a **"Profile Drift"** section below the Spoolman section:
+
+- Fetch on mount via `fetchDriftReport()`.
+- Loading state: spinner.
+- Error state (502/503): "Could not check — Laminus sidecar unreachable."
+- `all_clear: true`: green "All profiles current" row.
+- Otherwise: one collapsible accordion per non-empty category (Printers / Jobs / Spoolman Filaments), count in header, affected names in body.
+- "Re-check" button: clears local state and re-fetches.
+
 ---
 
-## Feature 5 — Laminus Health Chip
+## Feature 3 — Laminus Health Chip
+
+*(Renumbered from 5 — features 3 and 4 were not implemented.)*
 
 ### Backend — enhance `GET /api/v1/laminus/catalog/status`
 
-The existing endpoint already proxies `GET /api/health` from Laminus (extracting `catalog_loaded`, `catalog_building`, `profile_count`). Extend it to also:
+The existing endpoint already hits Laminus `GET /api/health` (5 s timeout, in a thread). Two additions:
 
-- Compute per-type counts from the in-memory `_catalog_dict` (no sidecar round-trip):
-  ```python
-  catalog_counts = {
-      "machine": len(_catalog_dict.get("machine", [])),
-      "process": len(_catalog_dict.get("process", [])),
-      "filament": len(_catalog_dict.get("filament", [])),
-  } if _catalog_dict else None
-  ```
-- Add a derived `status: str` field:
-  - `"unconfigured"` — `LAMINUS_SIDECAR_URL` not set
-  - `"offline"` — health check request failed or non-200
-  - `"building"` — `catalog_building: true`
-  - `"online"` — `catalog_loaded: true`
+**1. Add `catalog_counts` from the in-memory dict (zero sidecar cost):**
+
+```python
+catalog_counts = {
+    "machine": len(_catalog_dict.get("machine", [])),
+    "process": len(_catalog_dict.get("process", [])),
+    "filament": len(_catalog_dict.get("filament", [])),
+} if _catalog_dict else None
+```
+
+**2. Add derived `status` string:**
+
+| Condition | `status` |
+|---|---|
+| `LAMINUS_SIDECAR_URL` not set | `"unconfigured"` |
+| Health request raised / non-200 and non-503 | `"offline"` |
+| Health returned 503, or 200 with `catalog_building: true` | `"building"` |
+| Health returned 200 with `catalog_loaded: true` | `"online"` |
+| Health returned 200 with `catalog_loaded: false, catalog_building: false` | `"offline"` |
+
+503 during catalog rebuild is treated as `"building"` not `"offline"` — Laminus returns 503 while `warm_catalog_cache` polls (`laminus.py:77`).
+
+**3. Add a 30 s server-side memo** on the health check result (not the full catalog — just the 5-field health dict). Prevents every open browser tab from holding a thread for 5 s when Laminus is down.
 
 Updated response:
-
 ```json
 {
   "cached": true,
@@ -169,26 +235,20 @@ Updated response:
 }
 ```
 
-### Frontend — `LaminusStatusChip` component
+### Frontend — `LaminusStatusChip.tsx`
 
 **New file:** `frontend/src/components/LaminusStatusChip.tsx`
 
-Props: none (fetches internally).
-
-Behaviour:
-- On mount, fetch `GET /api/v1/laminus/catalog/status`.
-- Poll every 60 s via `setInterval`.
-- Render a small row: `●  Laminus  [status label]` where the dot color maps to status:
-  - `online` → green (`var(--ok)`)
-  - `building` → amber (`var(--warn)` or `#f59e0b`)
-  - `offline` → red (`var(--err)`)
-  - `unconfigured` → grey (`var(--text-3)`)
-- On click, toggle an inline detail block showing machine/process/filament counts and `fetched_at` formatted as a relative time ("3 min ago").
-- If `laminus_configured: false`, suppress the chip entirely (don't show a broken indicator when the feature isn't set up).
+- Fetches `GET /api/v1/laminus/catalog/status` on mount.
+- Polls every 60 s via `setInterval`; clears on unmount (`useEffect` cleanup).
+- Hidden entirely when `laminus_configured: false`.
+- Renders: colored dot + `"Laminus"` label + status text (e.g. `"online"`, `"building"`, `"offline"`).
+- Click toggles an inline detail block: machine / process / filament counts and last-fetched as a relative time ("3 min ago").
+- Dot colors: `online` → `var(--ok)` green; `building` → `#f59e0b` amber; `offline` → `var(--err)` red.
 
 ### Integration — `Sidebar.tsx`
 
-Add `<LaminusStatusChip />` to the Account `nav-section`, below the Settings `NavLink`. No props required; the chip manages its own data lifecycle.
+Add `<LaminusStatusChip />` to the Account `nav-section`, below the Settings `NavLink`. No props — chip manages its own data.
 
 ---
 
@@ -196,24 +256,31 @@ Add `<LaminusStatusChip />` to the Account `nav-section`, below the Settings `Na
 
 | Repo | File | Change |
 |---|---|---|
-| `themis` | `backend/app/api/routes/jobs.py` | `list_history`: join `GcodeFile`, add `filament_grams` to each history row |
+| `themis` | `backend/app/migrations/v008_job_filament_grams.py` | **New** — `ALTER TABLE jobs ADD COLUMN filament_grams REAL` |
+| `themis` | `backend/app/models.py` | Add `filament_grams: Mapped[Optional[float]]` to `Job` |
+| `themis` | `backend/app/api/routes/jobs.py` | `_to_dict`: include `job.filament_grams` |
+| `themis` | `backend/app/services/queue_engine.py` | Capture grams before gcode delete; fire deduction task |
 | `themis` | `backend/app/services/spoolman_service.py` | Add `record_spool_use(url, api_key, spool_id, grams)` |
-| `themis` | `backend/app/services/queue_engine.py` | Post-completion hook: fire-and-forget `record_spool_use` per `JobPrinterConfig` |
-| `themis` | `backend/app/api/routes/drift.py` | **New** — `GET /api/v1/drift` with module-level cache |
-| `themis` | `backend/app/api/routes/laminus.py` | Call `invalidate_drift_cache()` at end of `/catalog/refresh` and `/catalog/rescan` |
+| `themis` | `backend/app/services/catalog_utils.py` | **New** — `catalog_name_sets(catalog)` shared helper |
+| `themis` | `backend/app/api/routes/settings.py` | Use `catalog_name_sets` instead of inline set-builds |
+| `themis` | `backend/app/api/routes/drift.py` | **New** — `GET /api/v1/drift` |
 | `themis` | `backend/app/main.py` | Register `drift` router |
-| `themis` | `backend/app/api/routes/laminus.py` | Extend `catalog/status` response with `catalog_counts` and `status` |
+| `themis` | `backend/app/api/routes/laminus.py` | Extend `catalog/status`: `catalog_counts`, `status`, 30 s health memo |
 | `themis` | `frontend/src/screens/HistoryScreen.tsx` | Add `filament_grams` to type + table column |
 | `themis` | `frontend/src/api/drift.ts` | **New** — `fetchDriftReport()` |
 | `themis` | `frontend/src/screens/SettingsScreen.tsx` | Add "Profile Drift" section |
 | `themis` | `frontend/src/components/LaminusStatusChip.tsx` | **New** — polling status chip |
 | `themis` | `frontend/src/components/Sidebar.tsx` | Add `<LaminusStatusChip />` to Account section |
 
+---
+
 ## Tests
 
-| File | What to test |
+| File | Scenario |
 |---|---|
-| `backend/tests/api/test_jobs_api.py` | `GET /jobs/history` includes `filament_grams` when a `GcodeFile` row exists |
-| `backend/tests/services/test_spoolman_service.py` | `record_spool_use` calls correct Spoolman URL with correct payload |
-| `backend/tests/api/test_drift_api.py` | **New** — stale printer profile flagged; all-clear when catalog matches; Spoolman check skipped when not enabled; 5-min cache honoured |
-| `backend/tests/api/test_laminus_api.py` | `catalog/status` returns `catalog_counts` and correct `status` string |
+| `backend/tests/api/test_jobs_api.py` | `GET /jobs/history` includes `filament_grams` from `job.filament_grams`; null when not set |
+| `backend/tests/services/test_queue_engine.py` | `handle_print_complete` sets `job.filament_grams` from gcode before delete; calls `record_spool_use` once for the assigned printer's matched slot; skips deduction when SpoolmanConfig disabled; skips when grams null; HTTP error in `record_spool_use` does not affect job status |
+| `backend/tests/services/test_spoolman_service.py` | `record_spool_use` calls correct Spoolman URL with `{"use_weight": grams}` |
+| `backend/tests/api/test_drift_api.py` | **New** — stale machine profile flagged; stale job process profile flagged; null printer profile skipped; all-clear when catalog matches; Spoolman check skipped when not enabled; Spoolman fetch failure sets `spoolman_error`, returns partial result; cold catalog returns 502/503 |
+| `backend/tests/api/test_laminus_api.py` | `catalog/status` includes `catalog_counts` and correct `status` for each health state (online, building via 503, building via catalog_building flag, offline) |
+| `backend/tests/services/test_catalog_utils.py` | **New** — `catalog_name_sets` returns correct sets for normal catalog; empty catalog; missing keys |
