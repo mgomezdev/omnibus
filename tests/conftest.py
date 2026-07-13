@@ -37,6 +37,10 @@ def pytest_configure(config):
         "markers",
         "integration: requires the full Concordia Docker stack to be running",
     )
+    config.addinivalue_line(
+        "markers",
+        "slow: invokes OrcaSlicer; deselect with -m 'not slow'",
+    )
 
 
 def pytest_collection_modifyitems(config, items):

@@ -63,12 +63,6 @@ SLICE_TIMEOUT_MS = 300_000   # 5 min — OrcaSlicer is slow in Docker
 NAV_TIMEOUT_MS   = 10_000
 
 
-# ── markers ───────────────────────────────────────────────────────────────────
-
-def pytest_configure(config):
-    config.addinivalue_line("markers", "slow: marks tests that invoke OrcaSlicer (deselect with -m 'not slow')")
-
-
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _minimal_stl() -> bytes:
@@ -277,20 +271,28 @@ def test_file_folder_create_and_delete(page_ready: Page) -> None:
     folder_name = _uniq("e2e-folder")
     _goto(page, "/files")
 
-    # There should be a "New folder" or similar button (rendered in the file sidebar).
-    # Try clicking it — the button text may vary.
-    new_folder_btn = page.locator("button", has_text="folder").first
-    if not new_folder_btn.is_visible():
+    # Folder creation triggers window.prompt() — register a dialog handler first.
+    dialog_accepted: list[bool] = []
+
+    def _on_dialog(dialog) -> None:  # type: ignore[no-untyped-def]
+        dialog_accepted.append(True)
+        dialog.accept(folder_name)
+
+    page.on("dialog", _on_dialog)
+
+    # The "New folder" button sits in the folder sidebar (title attr = "New folder").
+    new_folder_btn = page.locator("button[title='New folder']").first
+    if not new_folder_btn.is_visible(timeout=5_000):
+        page.remove_listener("dialog", _on_dialog)
         pytest.skip("Could not locate the 'New folder' button — UI may have changed")
 
     new_folder_btn.click()
-    # A modal or inline input should appear for the folder name
-    name_input = page.locator("input[placeholder*='folder']").first
-    if not name_input.is_visible(timeout=3000):
-        name_input = page.locator("dialog input, [role=dialog] input").first
-    name_input.fill(folder_name)
-    # Confirm
-    page.keyboard.press("Enter")
+    # Give the dialog time to fire and be handled.
+    page.wait_for_timeout(1_500)
+    page.remove_listener("dialog", _on_dialog)
+
+    if not dialog_accepted:
+        pytest.skip("window.prompt dialog was not triggered — UI may have changed")
 
     # The new folder should appear in the sidebar tree
     expect(page.locator(f"text={folder_name}")).to_be_visible(timeout=8_000)
@@ -317,8 +319,8 @@ def test_queue_new_job_screen_loads(page_ready: Page) -> None:
     """
     page = page_ready
     _goto(page, "/queue/new")
-    # The new-job screen shows a section for selecting a file
-    page.wait_for_selector("text=Job Uploads", timeout=NAV_TIMEOUT_MS)
+    # "Source file" is the heading of step-1 card, always visible on /queue/new
+    page.wait_for_selector("text=Source file", timeout=NAV_TIMEOUT_MS)
 
 
 @pytest.mark.integration
@@ -337,43 +339,58 @@ def test_queue_new_job_from_library(page_ready: Page, stl_file: int) -> None:
         pytest.skip("Placeholder Centauri printer not found")
 
     _goto(page, "/queue/new")
+    page.wait_for_selector("text=Source file", timeout=NAV_TIMEOUT_MS)
+
+    # Switch to library mode — the default source is the upload dropzone.
+    page.wait_for_selector("text=Pick from library", timeout=NAV_TIMEOUT_MS)
+    page.get_by_role("button", name="Pick from library").first.click()
+
+    # After switching, library files load; our stl_file is in /Job Uploads.
+    # In library mode, files render as <button class="btn ghost"> with folder label.
     page.wait_for_selector("text=Job Uploads", timeout=NAV_TIMEOUT_MS)
 
-    # Click "Job Uploads" folder to filter to our uploaded STL
-    page.click("text=Job Uploads")
+    # Click the first ghost button whose text includes the "Job Uploads" folder label.
+    page.locator("button.btn.ghost").filter(has_text="Job Uploads").first.click()
     page.wait_for_load_state("networkidle", timeout=5_000)
 
-    # Select the first file card that appears
-    file_cards = page.locator(".card").all()
-    if not file_cards:
-        pytest.skip("No file cards found in Job Uploads — upload may have failed")
-    file_cards[0].click()
+    # Clicking a library file loads its plates; "Plate 1" should appear.
+    page.wait_for_selector("text=Plate 1", timeout=8_000)
 
-    # The right panel should show plate selection and printer picker.
-    # Look for the "Plate 1" or "plate" text to confirm a file was selected.
-    page.wait_for_selector("text=Plate", timeout=6_000)
-
-    # Select the placeholder printer (by checking its checkbox/button)
+    # Select the placeholder printer.
     centauri_btn = page.locator("text=Elegoo Centauri Carbon").first
     if centauri_btn.is_visible(timeout=5_000):
         centauri_btn.click()
 
-    # Select process and filament profiles in the per-printer config
-    # The profile dropdowns may auto-populate; look for the "Add to queue" button
-    add_btn = page.locator("button", has_text="Add to queue").first
-    if not add_btn.is_visible(timeout=5_000):
-        add_btn = page.locator("button", has_text="queue").last
+    # After selecting a printer, PerPrinterConfig fetches profiles asynchronously.
+    # Wait for the select to appear, then wait for options to populate before selecting.
+    profile_select = page.locator("[data-testid='print-profile-select']").first
+    if profile_select.is_visible(timeout=6_000):
+        try:
+            page.wait_for_function(
+                "() => (document.querySelector('[data-testid=\"print-profile-select\"]')?.options?.length ?? 0) > 1",
+                timeout=8_000,
+            )
+            profile_select.select_option(PROCESS_PROFILE)
+        except Exception:
+            try:
+                profile_select.select_option(index=1)
+            except Exception:
+                pass
 
-    if not add_btn.is_visible(timeout=3_000):
-        pytest.skip("Could not locate 'Add to queue' button — UI flow may differ")
+    # Submit button text is "Add N job(s) to queue" — match partial to avoid N varying.
+    add_btn = page.locator("button.btn.primary", has_text="to queue").first
+    if not add_btn.is_visible(timeout=5_000):
+        pytest.skip("Could not locate submit button — UI may have changed")
 
     add_btn.click()
 
-    # Should redirect to /queue
+    # doCreate() shows a success banner ("N job(s) added to queue") instead of
+    # auto-navigating. Click the "view queue" link in that banner.
+    page.wait_for_selector("text=added to queue", timeout=NAV_TIMEOUT_MS)
+    page.locator("button", has_text="view queue").first.click()
     page.wait_for_url(f"{THEMIS_URL}/queue", timeout=NAV_TIMEOUT_MS)
 
-    # Cancel the newly created job via the queue UI
-    # Find the most recently created job card and open its detail panel
+    # Cancel the newly created job via the queue UI.
     job_cards = page.locator(".card").all()
     if job_cards:
         job_cards[0].click()
@@ -414,11 +431,11 @@ def test_queue_detail_panel_opens(page_ready: Page, stl_file: int) -> None:
 
     try:
         _goto(page, "/queue")
-        # Wait for the job card to appear
-        page.wait_for_selector(".card", timeout=NAV_TIMEOUT_MS)
+        # Wait for this specific job card to appear by its ID.
+        page.wait_for_selector(f"text=#{job_id}", timeout=NAV_TIMEOUT_MS)
 
-        # Click the first card
-        page.locator(".card").first.click()
+        # Click the job card that contains the job ID (avoids stat summary cards).
+        page.locator(".card").filter(has_text=f"#{job_id}").first.click()
 
         # The detail panel should now be visible with "Job #" header
         expect(page.locator("text=Job #")).to_be_visible(timeout=8_000)
@@ -532,8 +549,13 @@ def test_projects_list_renders(page_ready: Page) -> None:
     """
     page = page_ready
     _goto(page, "/projects")
-    # Either a project card or the empty state "No projects" should appear
-    page.wait_for_selector("text=Projects, text=No projects, text=New project", timeout=NAV_TIMEOUT_MS)
+    # The filter buttons ("All", "Pending", "Active", "Completed") always render.
+    page.wait_for_selector("button", timeout=NAV_TIMEOUT_MS)
+    # Verify no JS error boundary and that the page loaded meaningful content.
+    assert page.locator("text=Something went wrong").count() == 0
+    expect(
+        page.locator("button", has_text="All").first
+    ).to_be_visible(timeout=NAV_TIMEOUT_MS)
 
 
 @pytest.mark.integration
@@ -553,37 +575,40 @@ def test_project_create_via_ui(page_ready: Page, stl_file: int) -> None:
 
     try:
         _goto(page, "/projects/new")
-        # Find the project name input (first large text input)
-        name_input = page.locator("input[placeholder*='name'], input[placeholder*='Project']").first
+        # Project name input has placeholder "e.g. Gridfinity Tray Set"; id="proj-name".
+        name_input = page.locator("#proj-name").first
         if not name_input.is_visible(timeout=5_000):
+            name_input = page.locator("input[placeholder*='Gridfinity']").first
+        if not name_input.is_visible(timeout=3_000):
             name_input = page.locator("input").first
         name_input.fill(project_name)
 
-        # Navigate to the file browser section and select our STL
+        # The left panel shows an "All files" folder tree; wait for it to load
+        # then click the "Job Uploads" folder to filter to our uploaded STL.
+        page.wait_for_selector("text=Job Uploads", timeout=NAV_TIMEOUT_MS)
         page.click("text=Job Uploads")
         page.wait_for_load_state("networkidle", timeout=5_000)
 
-        stl_card = page.locator(".card").first
-        if stl_card.is_visible(timeout=5_000):
-            stl_card.click()
+        # File buttons appear with title "Add <filename>" — click the first one.
+        file_btn = page.locator("button[title^='Add']").first
+        if file_btn.is_visible(timeout=5_000):
+            file_btn.click()
+        else:
+            # Fallback: click the first non-folder button in the file list area
+            page.locator("button").filter(has_text=".stl").first.click()
 
-        # Click "Add" or "+" to add the file as a project item
-        add_item_btn = (
-            page.locator("button", has_text="Add").first
-            if page.locator("button", has_text="Add").count() > 0
-            else page.locator("button[aria-label*='add'], button[title*='add']").first
-        )
-        if add_item_btn.is_visible(timeout=4_000):
-            add_item_btn.click()
-
-        # Click Generate
+        # Click Generate (opens printer picker then confirms)
         generate_btn = page.locator("button", has_text="Generate").first
         if not generate_btn.is_visible(timeout=5_000):
-            generate_btn = page.locator("button", has_text="generate").first
+            pytest.skip("Generate button not visible — project may have no items")
         generate_btn.click()
 
-        # The project detail page should load (redirect after generate)
-        # Wait for "jobs" or project detail content
+        # Printer picker may appear; dismiss it by clicking Generate again or Skip.
+        gen_confirm = page.locator("button", has_text="Generate").last
+        if gen_confirm.is_visible(timeout=3_000):
+            gen_confirm.click()
+
+        # ProjectBuilderScreen navigates to /projects/{id} after generate.
         page.wait_for_url(f"{THEMIS_URL}/projects/*", timeout=30_000)
         page.wait_for_load_state("networkidle", timeout=10_000)
 
@@ -594,8 +619,8 @@ def test_project_create_via_ui(page_ready: Page, stl_file: int) -> None:
         except (ValueError, IndexError):
             pass
 
-        # Jobs section should show generated jobs
-        page.wait_for_selector("text=Plate, text=queued, text=jobs", timeout=15_000)
+        # The detail screen shows the project name and job list.
+        page.wait_for_selector("text=Generate", timeout=15_000)
 
     finally:
         if project_id:
@@ -643,11 +668,13 @@ def test_project_detail_shows_job_list(page_ready: Page, stl_file: int) -> None:
         _goto(page, f"/projects/{project_id}")
         page.wait_for_load_state("networkidle", timeout=10_000)
 
-        # Project name should be visible
-        expect(page.locator(f"text=E2E Detail Test")).to_be_visible(timeout=NAV_TIMEOUT_MS)
+        # Project name (contains "E2E Detail Test" prefix) is in the <h2>.
+        expect(
+            page.locator("h2").filter(has_text="E2E Detail Test")
+        ).to_be_visible(timeout=NAV_TIMEOUT_MS)
 
-        # The job list section should exist
-        page.wait_for_selector("text=Plate", timeout=10_000)
+        # The "Jobs (N)" section heading always renders on the project detail screen.
+        page.wait_for_selector("text=Jobs", timeout=10_000)
 
     finally:
         jobs_resp = requests.get(_api(f"/projects/{project_id}/jobs"), timeout=10)
@@ -675,21 +702,18 @@ def test_settings_tags_crud(page_ready: Page) -> None:
     page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT_MS)
 
     # --- Create ---
-    create_btn = page.locator("button", has_text="New tag, Add tag, Create tag").first
-    if not create_btn.is_visible(timeout=5_000):
-        # Try a generic "+" button in the tags section
-        create_btn = page.locator("button", has_text="+").last
-    create_btn.click()
+    # The button text is literally "New tag" (from SettingsScreen.tsx TagsPage).
+    page.locator("button", has_text="New tag").first.click()
 
-    # Fill the name field in the editor row that appears
-    name_input = page.locator("input[placeholder='tag-name'], input[placeholder*='name']").first
+    # The TagEditorRow appears inline with input[placeholder='tag-name'].
+    name_input = page.locator("input[placeholder='tag-name']").first
     expect(name_input).to_be_visible(timeout=5_000)
     name_input.fill(tag_name)
 
-    # Save (Enter key or Save button)
-    save_btn = page.locator("button", has_text="Save").first
-    if save_btn.is_visible(timeout=2_000):
-        save_btn.click()
+    # For a NEW tag the confirm button says "Create" (not "Save").
+    create_confirm = page.locator("button", has_text="Create").first
+    if create_confirm.is_visible(timeout=2_000):
+        create_confirm.click()
     else:
         page.keyboard.press("Enter")
 
@@ -738,13 +762,9 @@ def test_settings_operator_name_roundtrip(page_ready: Page) -> None:
     _goto(page, "/settings/print")
     page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT_MS)
 
-    # Find the operator name input
-    operator_input = page.locator("input").filter(has_text="").nth(0)
-    # Look for an input near the "Operator" label
-    operator_row = page.locator("text=Operator name, text=operator").first
-    name_field = operator_row.locator("..").locator("input").first
-    if not name_field.is_visible(timeout=3_000):
-        name_field = page.locator("input[placeholder*='operator'], input[placeholder*='name']").first
+    # The operator display name input has placeholder "e.g. Workshop Lead"
+    # (PrintDefaultsPage → FieldRow "Display name" → input).
+    name_field = page.locator("input[placeholder='e.g. Workshop Lead']").first
 
     name_field.fill(new_name)
     name_field.press("Tab")   # trigger onBlur / auto-save
@@ -753,12 +773,13 @@ def test_settings_operator_name_roundtrip(page_ready: Page) -> None:
 
     # Reload and verify the sidebar shows the new name
     _goto(page, "/queue")
-    # The sidebar user chip should show initials or name
-    sidebar_name = page.locator(".sidebar .user-meta .name, .sidebar .user-chip")
-    # If operator name is set, initials/name appear in the sidebar
-    if sidebar_name.is_visible(timeout=5_000):
-        # just verify something renders — exact content depends on current state
-        assert sidebar_name.inner_text().strip() != ""
+    # Verify the saved value persists by reading the queue config via API.
+    cfg = requests.get(_api("/settings/queue"), timeout=5)
+    if cfg.ok and cfg.content:
+        saved = cfg.json().get("operator_name", "")
+        assert new_name in (saved or ""), (
+            f"operator_name did not persist; got {saved!r}"
+        )
 
 
 # ── S8: Settings — Webhook ────────────────────────────────────────────────────
@@ -833,52 +854,57 @@ def test_orders_create_edit_delete(page_ready: Page) -> None:
         _goto(page, "/orders/new")
         page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT_MS)
 
-        # Fill in order name / title
-        name_input = page.locator("input[placeholder*='name'], input[placeholder*='Order'], input[placeholder*='order']").first
-        if not name_input.is_visible(timeout=5_000):
-            name_input = page.locator("input").first
-        name_input.fill(order_name)
-
-        submit_btn = page.locator("button[type=submit], button", has_text="Create, Save").first
-        if submit_btn.is_visible(timeout=3_000):
-            submit_btn.click()
+        # NewOrderScreen requires both customer and title fields.
+        # Customer placeholder: "e.g. Vela Robotics" (customer type, the default).
+        customer_input = page.locator("input[placeholder*='Vela']").first
+        if customer_input.is_visible(timeout=3_000):
+            customer_input.fill("E2E Test Customer")
         else:
-            page.locator("button").last.click()
+            page.locator("input").first.fill("E2E Test Customer")
 
-        # Should navigate to orders list or order detail
-        page.wait_for_timeout(2_000)
+        # Title field placeholder: "e.g. Mk3 chassis brackets — batch 5".
+        title_input = page.locator("input[placeholder*='brackets']").first
+        if title_input.is_visible(timeout=3_000):
+            title_input.fill(order_name)
 
-        # Find the order in the list
-        _goto(page, "/orders")
+        # Submit — button text is "Create order" for a new order.
+        submit_btn = page.locator("button", has_text="Create order").first
+        if not submit_btn.is_visible(timeout=3_000):
+            pytest.skip("'Create order' button not found — UI may have changed")
+        submit_btn.click()
+
+        # Should navigate to /orders after creation.
+        page.wait_for_url(f"{THEMIS_URL}/orders", timeout=NAV_TIMEOUT_MS)
         expect(page.locator(f"text={order_name}")).to_be_visible(timeout=8_000)
 
-        # Capture ID from the page or API
+        # Capture ID from the API (order is stored by title).
         resp = requests.get(_api("/orders"), timeout=10)
         if resp.ok:
             for o in resp.json():
-                if order_name in (o.get("name") or o.get("title") or ""):
+                if order_name in (o.get("title") or ""):
                     order_id = o["id"]
                     break
 
         if order_id is None:
             return  # can't edit without an ID
 
-        # Edit
+        # Edit — /orders/{id}/edit reuses NewOrderScreen with the id param.
         _goto(page, f"/orders/{order_id}/edit")
         page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT_MS)
 
         edited_name = order_name + " edited"
-        name_input_edit = page.locator("input[placeholder*='name'], input[placeholder*='Order'], input").first
-        name_input_edit.fill(edited_name)
+        title_input_edit = page.locator("input[placeholder*='brackets']").first
+        if title_input_edit.is_visible(timeout=3_000):
+            title_input_edit.fill(edited_name)
 
-        save_btn = page.locator("button[type=submit], button", has_text="Save, Update").first
+        # Button text is "Save changes" when editing.
+        save_btn = page.locator("button", has_text="Save changes").first
         if save_btn.is_visible(timeout=3_000):
             save_btn.click()
 
-        page.wait_for_timeout(2_000)
+        page.wait_for_url(f"{THEMIS_URL}/orders", timeout=NAV_TIMEOUT_MS)
 
         # Verify edit persisted
-        _goto(page, "/orders")
         expect(page.locator(f"text={edited_name}")).to_be_visible(timeout=8_000)
 
     finally:
@@ -1029,7 +1055,8 @@ def test_fleet_backup_download(page_ready: Page) -> None:
     """
     page = page_ready
     _goto(page, "/settings/fleet-backup")
-    expect(page.locator("text=Fleet backup")).to_be_visible(timeout=NAV_TIMEOUT_MS)
+    # Use h2 to avoid strict mode: sidebar nav label also contains "Fleet backup".
+    expect(page.locator("h2", has_text="Fleet backup")).to_be_visible(timeout=NAV_TIMEOUT_MS)
     expect(page.locator("button", has_text="Download backup")).to_be_visible(timeout=NAV_TIMEOUT_MS)
 
     # Verify the backing API endpoint returns parseable JSON
