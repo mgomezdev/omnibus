@@ -1,7 +1,7 @@
 # Filament Consumption, Profile Drift & Laminus Health — Design Spec
 
 **Date:** 2026-07-13  
-**Revised:** 2026-07-14 (Feature 2 redesigned: drift check integrated into catalog sync; Spoolman online sanity check added)  
+**Revised:** 2026-07-14 (Feature 2 redesigned: drift check integrated into catalog sync; Spoolman online sanity check added; deduplication of remap prompts)  
 **Status:** Approved  
 **Repos:** `themis`
 
@@ -142,10 +142,15 @@ async def compute_drift(
 **Algorithm:**
 
 1. `removed_* = old_sets - new_sets` for machine, process, filament names, and filament UUIDs. If all four removal sets are empty, return `None` without touching the DB — the common case costs four set subtractions.
-2. **Printers:** for each `Printer` row, emit an entry if `current_orca_printer_profile` is in `removed_machine`; for each slot in `loaded_filaments`, emit an entry if its `filament_profile` is non-null and in `removed_filament_names`.
-3. **Jobs:** for each `Job` with `status IN ('queued', 'blocked')`, for each of its `JobPrinterConfig` rows, emit an entry if `print_profile` is in `removed_process` or `filament_profile` is non-null and in `removed_filament_names`. Include `file_name` from `UploadedFile.original_filename`.
-4. **Spoolman** (only if `spoolman_cfg` is enabled): `fetch_filaments()`, decode each filament's `extra.orca_profiles` (double-JSON-encoded dict UUID → name), emit an entry per UUID key in `removed_filament_uuids`. On HTTP error, set `spoolman_error` in the payload and skip this section — a Spoolman outage must not block a catalog sync.
-5. If no entries were emitted (removed profiles exist but nothing references them), return `None`.
+2. **Collect raw hits:**
+   - **Printers:** for each `Printer` row, record a hit if `current_orca_printer_profile` is in `removed_machine`; for each slot in `loaded_filaments`, record a hit if its `filament_profile` is non-null and in `removed_filament_names`.
+   - **Jobs:** for each `Job` with `status IN ('queued', 'blocked')`, for each of its `JobPrinterConfig` rows, record a hit if `print_profile` is in `removed_process` or `filament_profile` is non-null and in `removed_filament_names`. Track the config's `file_name` (from `UploadedFile.original_filename`).
+   - **Spoolman** (only if `spoolman_cfg` is enabled): `fetch_filaments()`, decode each filament's `extra.orca_profiles` (double-JSON-encoded dict UUID → name), record a hit per UUID key in `removed_filament_uuids`. On HTTP error, set `spoolman_error` in the payload and skip this section — a Spoolman outage must not block a catalog sync.
+3. **Deduplicate into grouped entries** (one user prompt per unique stale value, not per affected object):
+   - **Spoolman:** group by `stale_uuid`. Each entry carries `affected_filament_ids: [int, ...]` and `affected_filament_names: [str, ...]`.
+   - **Jobs:** group by `(field, stale_value)`. Each entry carries `affected_config_ids: [int, ...]` and `affected_file_names: [str, ...]`.
+   - **Printers:** group by `(field, stale_value)`. Each entry carries `affected_printer_ids: [int, ...]`, `affected_printer_names: [str, ...]`, and `affected_slots: [int | null, ...]` (null for `current_orca_printer_profile`, slot index for `loaded_filaments.filament_profile`). Keep `required: true`.
+4. If no grouped entries exist (removed profiles exist but nothing references them), return `None`.
 
 As in the previous revision, `ProjectItem.filament_profile_uuid` is not checked — legacy field, no UI path populates it.
 
@@ -157,18 +162,44 @@ As in the previous revision, `ProjectItem.filament_profile_uuid` is not checked 
   "sync_id": "b3f1c9e0-…",
   "pending": {
     "printers": [
-      {"printer_id": 1, "printer_name": "X1C", "field": "current_orca_printer_profile",
-       "slot": null, "stale_value": "Bambu X1C 0.4 nozzle", "options_kind": "machine", "required": true},
-      {"printer_id": 1, "printer_name": "X1C", "field": "loaded_filaments.filament_profile",
-       "slot": 0, "stale_value": "Generic PLA Old", "options_kind": "filament", "required": true}
+      {
+        "field": "current_orca_printer_profile",
+        "stale_value": "Bambu X1C 0.4 nozzle",
+        "options_kind": "machine",
+        "required": true,
+        "affected_printer_ids": [1, 3],
+        "affected_printer_names": ["X1C-left", "X1C-right"],
+        "affected_slots": [null, null]
+      },
+      {
+        "field": "loaded_filaments.filament_profile",
+        "stale_value": "Generic PLA Old",
+        "options_kind": "filament",
+        "required": true,
+        "affected_printer_ids": [1],
+        "affected_printer_names": ["X1C-left"],
+        "affected_slots": [0]
+      }
     ],
     "jobs": [
-      {"job_id": 5, "config_id": 12, "file_name": "bracket.3mf", "field": "print_profile",
-       "stale_value": "0.20mm Standard Old", "options_kind": "process", "required": false}
+      {
+        "field": "print_profile",
+        "stale_value": "0.20mm Standard Old",
+        "options_kind": "process",
+        "required": false,
+        "affected_config_ids": [12, 17],
+        "affected_file_names": ["bracket.3mf", "clip.3mf"]
+      }
     ],
     "spoolman_filaments": [
-      {"filament_id": 9, "filament_name": "PolyLite PLA", "stale_uuid": "a1b2…",
-       "stale_name": "PolyLite PLA @X1C", "options_kind": "filament_uuid", "required": false}
+      {
+        "stale_uuid": "a1b2…",
+        "stale_name": "PolyLite PLA @X1C",
+        "options_kind": "filament_uuid",
+        "required": false,
+        "affected_filament_ids": [9, 14, 22],
+        "affected_filament_names": ["PolyLite PLA Red", "PolyLite PLA Blue", "PolyLite PLA White"]
+      }
     ]
   },
   "options": {
@@ -214,15 +245,22 @@ Drift detection returns HTTP 200 (the pre-scan succeeded); the `status` field di
 
 ### Backend — `POST /api/v1/laminus/catalog/confirm-remap`
 
-Request body:
+Request body: resolutions are keyed by stale value/UUID (one resolution per grouped entry). The apply step fans out each resolution to all affected object IDs from the pending payload.
 
 ```json
 {
   "sync_id": "b3f1c9e0-…",
   "resolutions": {
-    "printers": [{"printer_id": 1, "field": "current_orca_printer_profile", "slot": null, "new_value": "Bambu X1C 0.4 nozzle (new)"}],
-    "jobs": [{"config_id": 12, "field": "print_profile", "new_value": null}],
-    "spoolman_filaments": [{"filament_id": 9, "stale_uuid": "a1b2…", "new_uuid": null}]
+    "printers": [
+      {"field": "current_orca_printer_profile", "stale_value": "Bambu X1C 0.4 nozzle", "new_value": "Bambu X1C 0.4 nozzle (new)"},
+      {"field": "loaded_filaments.filament_profile", "stale_value": "Generic PLA Old", "new_value": "Generic PLA @0.4 nozzle"}
+    ],
+    "jobs": [
+      {"field": "print_profile", "stale_value": "0.20mm Standard Old", "new_value": null}
+    ],
+    "spoolman_filaments": [
+      {"stale_uuid": "a1b2…", "new_uuid": "c3d4…"}
+    ]
   }
 }
 ```
@@ -230,14 +268,14 @@ Request body:
 **Validation (all before any write):**
 
 - `_pending_sync` is None or `sync_id` mismatch → **409** ("sync superseded or expired — re-run the catalog sync").
-- Every `pending.printers` entry must have a matching resolution with a non-null `new_value` present in the pending catalog's corresponding name set → **422** listing the unresolved entries.
+- Every `pending.printers` grouped entry must have a matching resolution (matched on `field` + `stale_value`) with a non-null `new_value` present in the pending catalog's corresponding name set → **422** listing the unresolved entries.
 - Job/Spoolman resolutions: `new_value`/`new_uuid` may be null (clear/drop) or must be valid in the pending catalog → **422** if invalid. Missing resolution entries are treated as null.
 
 **Apply (single DB transaction):**
 
-- Printers: set `current_orca_printer_profile`, or rewrite the slot dict's `filament_profile` — reassign the whole `loaded_filaments` list so SQLAlchemy detects the JSON mutation.
-- Jobs: set `JobPrinterConfig.print_profile` / `filament_profile` to the new value or `NULL`.
-- Spoolman (after commit, best-effort per filament): decode `extra.orca_profiles`, delete the stale UUID key, insert `new_uuid → name` (name looked up from the pending catalog) if provided, re-encode, and PATCH via a new `spoolman_service.update_filament_extra(url, api_key, filament_id, extra)`. A per-filament HTTP failure is logged and reported in the response's `spoolman_failures` list but does not abort the swap.
+- Printers: for each printer resolution, look up the grouped entry's `affected_printer_ids` and `affected_slots` from `_pending_sync`. For each (printer_id, slot) pair: if slot is null, set `current_orca_printer_profile` to `new_value`; if slot is an index, rewrite `loaded_filaments[slot].filament_profile` — reassign the whole list so SQLAlchemy detects the JSON mutation.
+- Jobs: for each job resolution, iterate its grouped entry's `affected_config_ids` and set `JobPrinterConfig.print_profile` / `filament_profile` to the new value or `NULL`.
+- Spoolman (after commit, best-effort per filament): for each Spoolman resolution, iterate its grouped entry's `affected_filament_ids`. For each: decode `extra.orca_profiles`, delete the `stale_uuid` key, insert `new_uuid → name` (name looked up from the pending catalog) if `new_uuid` is non-null, re-encode, and PATCH via `spoolman_service.update_filament_extra(url, api_key, filament_id, extra)`. A per-filament HTTP failure is logged and reported in the response's `spoolman_failures` list but does not abort the swap.
 
 **Complete:** `_commit_catalog(pending.raw, pending.catalog)`, clear `_pending_sync`, return `{"status": "ok", "applied": {"printers": n, "jobs": n, "spoolman_filaments": n}, "spoolman_failures": []}`.
 
@@ -265,7 +303,8 @@ export async function confirmRemap(syncId: string, resolutions: Resolutions): Pr
 
 **New file:** `frontend/src/components/RemapModal.tsx`. Props: `payload: PendingRemaps`, `onDone(result)`, `onCancel()`.
 
-- Three groups, rendered only when non-empty: **Printers**, **Queued Jobs**, **Spoolman Filaments**. Each row shows the owning object (printer name + slot, job file name, filament name), the stale value struck through, and a dropdown.
+- Three groups, rendered only when non-empty: **Printers**, **Queued Jobs**, **Spoolman Filaments**. Each row represents one deduplicated grouped entry (one unique stale value), not one affected object.
+- Each row shows: the stale value struck through, a count badge ("affects 2 printers", "affects 3 jobs", "affects 15 filaments"), and a dropdown. When the count is 1, show the single object name instead of the badge (e.g. "X1C-left", "bracket.3mf", "PolyLite PLA Red").
 - Printer dropdowns: options from `options.machine` or `options.filament` per `options_kind`; no empty choice; unselected state blocks confirm.
 - Job and Spoolman dropdowns: same option lists (Spoolman uses `options.filament_uuids`, displaying names, submitting UUIDs) plus a leading **"— clear —"** option, preselected. "Clear" submits `null`.
 - If `spoolman_error` is set, show a warning banner: Spoolman references could not be checked this sync.
@@ -293,7 +332,7 @@ When `POST /api/v1/settings/spoolman/test` receives a successful response from S
 2. Call `catalog_name_sets(_catalog_dict)` → `filament_uuids`.
 3. `fetch_filaments()` from Spoolman. For each filament, decode `extra.orca_profiles` (double-JSON-encoded). Collect every UUID key not in `filament_uuids`.
 4. If no stale UUIDs, return the existing success response unchanged.
-5. If stale UUIDs found: generate a `sync_id`, write `_pending_sync` with `raw=None` and `catalog=None` (no catalog swap will happen on confirm — only Spoolman updates apply), and return `status: "pending_remaps"` with `printers: []`, `jobs: []`, `spoolman_filaments: [...]`, and `options.filament_uuids` from `_catalog_dict`. The `options` other keys (`machine`, `process`, `filament`) are empty lists.
+5. If stale UUIDs found: group hits by `stale_uuid` (same dedup logic as `compute_drift` — one entry per unique UUID, with `affected_filament_ids` and `affected_filament_names`). Generate a `sync_id`, write `_pending_sync` with `raw=None` and `catalog=None` (no catalog swap will happen on confirm — only Spoolman updates apply), and return `status: "pending_remaps"` with `printers: []`, `jobs: []`, `spoolman_filaments: [deduplicated entries]`, and `options.filament_uuids` from `_catalog_dict`. The `options` other keys (`machine`, `process`, `filament`) are empty lists.
 
 **`confirm-remap` reuse:** No changes to the confirm-remap endpoint. When `_pending_sync.raw` is `None`, the endpoint skips `_commit_catalog` after applying Spoolman updates and just clears the pending slot. `printers` and `jobs` resolution lists will be empty; the existing "missing resolution for required entry" validation trivially passes (no required entries).
 
@@ -399,7 +438,7 @@ Add `<LaminusStatusChip />` to the Account `nav-section`, below the Settings `Na
 | `backend/tests/api/test_jobs_api.py` | `GET /jobs/history` includes `filament_grams` from `job.filament_grams`; null when not set |
 | `backend/tests/services/test_queue_engine.py` | `handle_print_complete` sets `job.filament_grams` from gcode before delete; calls `record_spool_use` once for the assigned printer's matched slot; skips deduction when SpoolmanConfig disabled; skips when grams null; HTTP error in `record_spool_use` does not affect job status |
 | `backend/tests/services/test_spoolman_service.py` | `record_spool_use` calls correct Spoolman URL with `{"use_weight": grams}` |
-| `backend/tests/api/test_laminus_api.py` | **Feature 2** — refresh with identical catalog completes immediately (`status: "ok"`, cache swapped); refresh with removed profile referenced by a printer returns `status: "pending_remaps"` with correct pending entries and options, and `GET /catalog` still serves the old catalog; confirm-remap with valid resolutions updates `Printer` / `JobPrinterConfig` rows, swaps the cache, and clears the pending slot; confirm-remap missing a required printer resolution (or with a value not in the incoming catalog) returns 422 and applies nothing; confirm-remap with stale/unknown `sync_id` returns 409; Spoolman resolution with `new_uuid: null` drops the stale UUID key from `extra.orca_profiles` via `update_filament_extra`; cold cache (first sync) commits without drift check; Spoolman-only confirm (`raw=None`) applies `update_filament_extra` and clears pending slot without calling `_commit_catalog` |
-| `backend/tests/api/test_settings_api.py` | **Feature 2 (Spoolman sanity check)** — test-connection success with all Spoolman UUIDs present in catalog returns normal success response; test-connection success with one stale UUID returns `status: "pending_remaps"` with `printers: []`, `jobs: []`, one `spoolman_filaments` entry, and `options.filament_uuids` from the cached catalog; cold catalog (`_catalog_dict` is None) at test-connection time returns normal success without checking UUIDs |
+| `backend/tests/api/test_laminus_api.py` | **Feature 2** — refresh with identical catalog completes immediately (`status: "ok"`, cache swapped); refresh with removed profile referenced by a printer returns `status: "pending_remaps"` with correct grouped entries (including `affected_printer_ids`) and options, and `GET /catalog` still serves the old catalog; two queued jobs with the same stale `print_profile` produce **one** `jobs` pending entry with two `affected_config_ids`; confirm-remap resolution keyed by `(field, stale_value)` is applied to all `affected_config_ids`; confirm-remap with valid resolutions updates `Printer` / `JobPrinterConfig` rows, swaps the cache, and clears the pending slot; confirm-remap missing a required printer resolution (or with a value not in the incoming catalog) returns 422 and applies nothing; confirm-remap with stale/unknown `sync_id` returns 409; Spoolman resolution with `new_uuid: null` drops the stale UUID key from all `affected_filament_ids` via `update_filament_extra`; cold cache (first sync) commits without drift check; Spoolman-only confirm (`raw=None`) applies `update_filament_extra` and clears pending slot without calling `_commit_catalog` |
+| `backend/tests/api/test_settings_api.py` | **Feature 2 (Spoolman sanity check)** — test-connection success with all Spoolman UUIDs present in catalog returns normal success response; test-connection success where three filaments share one stale UUID returns `status: "pending_remaps"` with one `spoolman_filaments` grouped entry having three `affected_filament_ids`; cold catalog (`_catalog_dict` is None) at test-connection time returns normal success without checking UUIDs |
 | `backend/tests/api/test_laminus_api.py` | **Feature 3** — `catalog/status` includes `catalog_counts` and correct `status` for each health state (online, building via 503, building via catalog_building flag, offline) |
-| `backend/tests/services/test_catalog_utils.py` | **New** — `catalog_name_sets` returns correct sets for normal catalog; empty catalog; missing keys. `compute_drift`: returns None when no removals; returns None when removals are unreferenced; flags printer machine + slot filament, queued/blocked job configs only, stale Spoolman UUIDs; Spoolman disabled → section skipped; Spoolman fetch failure → `spoolman_error` set, other sections intact |
+| `backend/tests/services/test_catalog_utils.py` | **New** — `catalog_name_sets` returns correct sets for normal catalog; empty catalog; missing keys. `compute_drift`: returns None when no removals; returns None when removals are unreferenced; flags printer machine + slot filament, queued/blocked job configs only, stale Spoolman UUIDs; multiple objects sharing the same stale value produce a single grouped entry with all affected IDs; Spoolman disabled → section skipped; Spoolman fetch failure → `spoolman_error` set, other sections intact |
