@@ -12,9 +12,7 @@
 
 services:
   mock-laminus:
-    build:
-      context: tests/e2e/mocks
-    command: uvicorn laminus_mock:app --host 0.0.0.0 --port 5000
+    image: ${MOCK_LAMINUS_IMAGE:-ninjabuffalo/laminus-mock:latest}
     ports:
       - "5100:5000"
     environment:
@@ -51,6 +49,7 @@ services:
       - themis-test-data:/data
     environment:
       - LAMINUS_SIDECAR_URL=http://mock-laminus:5000
+      - SPOOLMAN_URL=http://mock-spoolman:7912
       - THEMIS_LIBRARY_DIR=/data/library
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
@@ -60,6 +59,8 @@ services:
       start_period: 15s
     depends_on:
       mock-laminus:
+        condition: service_healthy
+      mock-spoolman:
         condition: service_healthy
     restart: unless-stopped
 
