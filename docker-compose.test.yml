@@ -12,6 +12,11 @@
 #
 # Mock Laminus is exposed on port 5100 so tests can call /api/test/known-profile
 # directly to discover the stable profile UUIDs needed to register a mock printer.
+#
+# Ordinus is included so the ordinus-themis integration tests can run:
+#   pytest tests/e2e/test_ordinus_themis_integration.py --integration
+# Ordinus API is exposed on host port 3002 (nginx → Express on :80 in container).
+# Override: ORDINUS_IMAGE=ninjabuffalo/gridfinity-customizer:local
 
 services:
   mock-laminus:
@@ -65,6 +70,32 @@ services:
       mock-laminus:
         condition: service_healthy
       mock-spoolman:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ordinus:
+    image: ${ORDINUS_IMAGE:-ninjabuffalo/gridfinity-customizer:latest}
+    ports:
+      - "${ORDINUS_PORT:-3002}:80"
+    environment:
+      - THEMIS_URL=http://themis:8000
+      - DB_PATH=:memory:
+      - NODE_ENV=test
+      - LOG_LEVEL=warn
+      - IMAGE_DIR=/tmp/ordinus/images
+      - GENERATED_STL_DIR=/tmp/ordinus/generated
+      - USER_STL_DIR=/tmp/ordinus/user-stls
+      - USER_STL_IMAGE_DIR=/tmp/ordinus/user-stl-images
+      - CORS_ORIGIN=*
+      - PUBLIC_URL=http://localhost:3002
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    depends_on:
+      themis:
         condition: service_healthy
     restart: unless-stopped
 

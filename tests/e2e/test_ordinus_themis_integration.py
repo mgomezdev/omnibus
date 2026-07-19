@@ -23,7 +23,6 @@ Run:
 
 from __future__ import annotations
 
-import os
 import time
 from typing import Any
 
@@ -32,14 +31,12 @@ import requests
 from helpers import (
     FILAMENT_PROFILE,
     MACHINE_PROFILE,
+    ORDINUS_URL,
     PROCESS_PROFILE,
     THEMIS_URL,
     _drain_active_jobs_for_printer,
     _find_centauri_placeholder_id,
 )
-
-_ordinus_port = os.environ.get("ORDINUS_PORT", "3001")
-ORDINUS_URL = os.environ.get("ORDINUS_URL", f"http://localhost:{_ordinus_port}")
 
 BOM_TIMEOUT_S    = 120
 SLICE_TIMEOUT_S  = 300

@@ -13,6 +13,10 @@ THEMIS_URL = os.environ.get("THEMIS_URL", f"http://localhost:{_themis_port}")
 # In docker-compose.test.yml mock-laminus is exposed on 5100; real Laminus is internal.
 LAMINUS_URL = os.environ.get("LAMINUS_URL", "http://localhost:5100")
 
+# Ordinus API — 3002 matches docker-compose.test.yml; override with ORDINUS_URL or ORDINUS_PORT.
+_ordinus_port = os.environ.get("ORDINUS_PORT", "3002")
+ORDINUS_URL = os.environ.get("ORDINUS_URL", f"http://localhost:{_ordinus_port}")
+
 MACHINE_PROFILE  = "Elegoo Centauri Carbon 0.4 nozzle"
 PROCESS_PROFILE  = "0.16mm Optimal @Elegoo CC 0.4 nozzle"
 FILAMENT_PROFILE = "Elegoo PLA @ECC"
