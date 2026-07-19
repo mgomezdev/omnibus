@@ -10,6 +10,7 @@ Concordia (this repo, `omnibus` on disk) is the orchestration layer for the full
 omnibus/
 ├── docker-compose.yml          # Production: pull images from Docker Hub
 ├── docker-compose.local.yml    # Dev override: build from local sibling repos
+├── docker-compose.test.yml     # CI test stack: mock-laminus + Themis + Ordinus + mock-spoolman
 ├── .env                        # Active env overrides (not committed)
 ├── .env.example                # Reference env vars
 ├── CLAUDE.md                   # Claude Code project instructions
@@ -18,10 +19,14 @@ omnibus/
 │   ├── slicing-flow.md         # Full slicing pipeline (Mermaid diagrams)
 │   └── superpowers/specs/      # Feature design documents
 └── tests/
-    ├── conftest.py
     └── e2e/
+        ├── conftest.py          # Session-scoped seed_test_data fixture (printers, profiles)
+        ├── helpers.py           # THEMIS_URL, LAMINUS_URL, ORDINUS_URL; shared helpers
+        ├── seed.py              # Declarative test data (PRINTERS list)
         ├── test_centauri_slice.py
-        └── test_ordinus_themis_integration.py
+        ├── test_ordinus_themis_integration.py
+        ├── test_project_jobs.py
+        └── test_ui.py           # Playwright UI tests
 ```
 
 ---
@@ -113,16 +118,27 @@ Laminus passes `ORCA_VERSION` to its entrypoint script, which downloads the matc
 
 ## E2E Tests
 
-E2E tests target a running stack. Run them with:
+E2E tests target a running stack. The `conftest.py` session fixture seeds known test data (placeholder printers, profiles) before any test runs.
 
 ```bash
-# Stack must be running first
+# Stack must be running first (docker compose up or docker-compose.test.yml for CI)
 pytest tests/e2e/test_centauri_slice.py --integration
 pytest tests/e2e/test_ordinus_themis_integration.py --integration
+
+# Run all integration tests
+pytest tests/e2e/ --integration
 
 # Override service URLs (defaults match .env):
 THEMIS_URL=http://localhost:8001 ORDINUS_URL=http://localhost:3002 pytest tests/e2e/ --integration
 ```
+
+### Test data seeding
+
+`conftest.py` runs a session-scoped `seed_test_data` fixture before any test. It:
+- Creates the `Elegoo Centauri Carbon (placeholder)` mock printer in Themis (with `queue_on=False` so the queue engine never auto-processes its jobs — keeps them in "queued" for UI tests)
+- Injects the Elegoo Centauri Carbon OrcaSlicer profiles from Laminus into the printer record
+
+`seed.py` declares the canonical test printer list (`PRINTERS`). Edit it to add fixtures needed by new tests.
 
 ### test_centauri_slice.py
 
@@ -143,6 +159,10 @@ Tests the Ordinus → Themis bidirectional integration:
 2. **Resend dedup** — resending the same layout creates a new project but reuses the same Themis file IDs (per-layout content-hash dedup)
 3. **Cross-layout dedup** — two layouts sharing the same bin model get the same Themis file IDs
 4. **Full pipeline** — Ordinus BOM → send to Themis → verify-slice on Elegoo Centauri Carbon → `ok=true`
+
+### test_project_jobs.py / test_ui.py
+
+Additional Themis tests: job lifecycle via API, and Playwright-driven UI interaction tests.
 
 ---
 
